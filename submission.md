@@ -1,0 +1,102 @@
+# Project 5 — Mixtape Bug Hunt — Submission
+
+**Author:** p-disha
+**Branch:** `bugfix/mixtape`
+
+---
+
+## AI Usage
+
+I worked through this project with **Claude Code (Opus 4.8)** acting as a pair-programming
+assistant, and I used it heavily during the two phases the brief calls out — codebase
+navigation and debugging — not just for writing patch code. Being specific about what that
+looked like:
+
+**Codebase navigation.** After cloning the starter I had the assistant read every service,
+route, model, and test file and summarize each module's responsibility, then trace two call
+chains end-to-end (rate-a-song → `notification_service.rate_song`, and view-playlist →
+`playlist_service.get_playlist_songs`). This is the source of the codebase map below. I
+verified the map against the files myself — the models section in particular, since the
+`playlist_entries` association table carries the `position` / `added_by` / `added_at` columns
+that turn out to matter for Issues #3 and #5.
+
+**Reproduction before diagnosis.** I insisted on reproducing every bug before changing a line.
+I wrote a throwaway script (`repro_tmp.py`, not committed) that drove the service functions
+against the seeded DB and against crafted state (e.g. a listening event stamped "yesterday
+23:00" for Issue #2, a fresh rating for Issue #4). The assistant helped me build that harness
+quickly. The empirical output is quoted in each RCA entry's "how you reproduced it" field.
+
+**Where AI helped me understand something.** The most useful moment was Issue #3. Reading the
+code, the `outerjoin` to `song_tags` *looks* like a textbook row-fan-out duplicate bug (one row
+per tag). But when I actually ran `search_songs("Anthem")` it returned the song **once**, even
+though the raw joined query returned **three** rows. I asked the assistant why, and it explained
+that SQLAlchemy's legacy `Query` API automatically de-duplicates full-entity results by identity
+map — so the fan-out is masked at the service layer in this version. I verified that myself by
+running the raw joined-row query (3 rows) next to the service call (1 result). That nuance is
+the difference between a surface-level RCA and a correct one, and it changed how I wrote the
+entry.
+
+**Where I had to verify or the AI was incomplete.** For Issue #2 the AI's first instinct was
+that a 24-hour window is "basically today," which is wrong — the whole point of the bug is that a
+rolling 24h window and a calendar-day boundary diverge in the morning. I confirmed the divergence
+with the crafted-event repro (event 6.9h old, inside the 24h window, but before today's midnight)
+rather than taking the explanation at face value. I also double-checked the ISO-weekday reasoning
+for Issue #1 against Python directly (`datetime(2024,6,16).weekday()` → `6`) instead of trusting
+recall.
+
+Net: AI did the fast reading and call-chain tracing and helped me articulate root causes; every
+diagnosis was confirmed by running the code with controlled inputs before I committed a fix.
+
+---
+
+## Codebase Map
+
+Mixtape is a Flask + SQLAlchemy JSON API for a social music app. The organizing pattern is
+strict and consistent: **routes parse/format, services hold all business logic, models define
+data.** Every route immediately delegates to a service function and does nothing else but input
+validation and `jsonify`.
+
+### Main files and their roles
+
+| File | Responsibility |
+|------|----------------|
+| `app.py` | Flask application factory (`create_app`). Instantiates the `SQLAlchemy` object `db`, configures the SQLite URI, registers the four blueprints under `/songs`, `/playlists`, `/users`, `/feed`, and calls `db.create_all()`. |
+| `models.py` | All 8 SQLAlchemy models/tables. Entities: `User`, `Tag`, `Song`, `ListeningEvent`, `Rating`, `Playlist`, `Notification`. Association tables: `friendships` (symmetric self-referential M2M on `User`), `song_tags` (M2M `Song`↔`Tag`), and `playlist_entries` (M2M `Playlist`↔`Song` **plus** `position`, `added_by`, `added_at` columns — playlist songs have an explicit order, not just insertion order). |
+| `routes/songs.py` | `GET /songs/search?q=`, `GET /songs/<id>`, `POST /songs/<id>/rate`, `POST /songs/<id>/listen`. |
+| `routes/playlists.py` | `POST /playlists/`, `GET /playlists/<id>`, `GET /playlists/<id>/songs`, `POST /playlists/<id>/songs`. |
+| `routes/users.py` | `GET /users/<id>`, `GET /users/<id>/streak`, `GET /users/<id>/notifications`, `POST /users/notifications/<id>/read`. |
+| `routes/feed.py` | `GET /feed/<id>/listening-now`, `GET /feed/<id>/activity`. |
+| `services/streak_service.py` | `record_listening_event` (creates a `ListeningEvent` + updates streak), `update_listening_streak` (the day-delta streak rules), `get_streak`. |
+| `services/feed_service.py` | `get_friends_listening_now` (recent-window feed, deduped to one row per friend), `get_activity_feed` (last N events, no recency filter). |
+| `services/search_service.py` | `search_songs` (case-insensitive title/artist match), `get_song`. |
+| `services/notification_service.py` | `create_notification`, `add_to_playlist` (adds song + notifies sharer), `rate_song` (saves/updates a `Rating`), `get_notifications`, `mark_as_read`. |
+| `services/playlist_service.py` | `create_playlist`, `get_playlist_songs` (ordered by `position`), `get_playlist`, `get_user_playlists`. |
+| `seed_data.py` | Drops + recreates all tables and seeds 5 users (with friendships), 13 songs (0/1/3-tag mixes), 3 playlists (5–7 songs), listening events (recent + 1–14 days old), streaks, and one example `song_added_to_playlist` notification. |
+| `tests/` | `test_streaks.py`, `test_search.py`, `test_playlists.py` — pytest, each using an in-memory SQLite app fixture. Several tests already assert *post-fix* behavior and fail on the starter. |
+
+### Data flow — "a friend adds my shared song to a playlist and I get notified"
+
+This is the working notification path (the one Issue #4 says is missing for ratings), traced end to end:
+
+1. `POST /playlists/<playlist_id>/songs` with `{song_id, added_by}` hits `add_song` in `routes/playlists.py`. It validates the two fields and calls `add_to_playlist(playlist_id, song_id, added_by)`.
+2. `add_to_playlist` in `notification_service.py` loads the `Song`, the adding `User`, and the `Playlist` (raising `ValueError` for any missing — the route turns that into a 400).
+3. If the song isn't already in `playlist.songs`, it appends it (writing a `playlist_entries` row) and commits.
+4. **The notification step:** if `song.shared_by != added_by_user_id`, it calls `create_notification(user_id=song.shared_by, type="song_added_to_playlist", body="…added your song…")`. `create_notification` persists a `Notification` row addressed to the original sharer.
+5. The sharer later calls `GET /users/<id>/notifications` → `get_notifications` → returns their `Notification` rows newest-first.
+
+The key structural takeaway: **notifications are created by the service that handles the
+interaction, guarded by an "actor ≠ owner" check.** `rate_song` handles the rating interaction
+but never performs step 4 — that is Issue #4.
+
+### Patterns I noticed
+
+- **Route → service delegation is total.** No business logic lives in routes. To debug any endpoint you jump straight to the one service function it calls (README says exactly this).
+- **Datetimes are UTC-aware** (`datetime.now(timezone.utc)`), but `last_listened_at` read back from SQLite can be naive — `update_listening_streak` defensively re-attaches `tzinfo`. Time-boundary bugs (#1, #2) live in this layer.
+- **`.to_dict()` on every model** is the single serialization boundary; `Song.to_dict()` pulls tags via the `song_tags` relationship, so search does **not** need to join `song_tags` itself to return tags (relevant to #3).
+- **Association tables with payload columns** (`playlist_entries.position`) mean list order is explicit and must be respected by queries (`ORDER BY position`) — relevant to #5.
+
+---
+
+## Root Cause Analysis
+
+_(entries added per fix below)_
