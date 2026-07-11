@@ -298,3 +298,15 @@ my 2 new notification tests).
 | 5 | Last playlist song hidden | `playlist_service.py` | Removed the `songs[:-1]` slice that dropped the highest-position song. |
 
 Each fix is an isolated commit on `bugfix/mixtape` using conventional-commit format.
+
+---
+
+## Screenshots
+
+`git log --oneline` on `bugfix/mixtape` (one commit per fix):
+
+![git log --oneline](screenshots/git-log.png)
+
+`pytest tests/` — full suite passing:
+
+![pytest 15 passed](screenshots/pytest.png)
