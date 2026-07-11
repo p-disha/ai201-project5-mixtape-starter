@@ -152,3 +152,43 @@ returned. Side-effects: `test_playlists.py` now passes 3/3 (was 1/3), including
 `test_playlist_returns_songs_in_order` (order preserved — I only removed the truncation, not the
 `ORDER BY position`) and `test_empty_playlist_returns_empty_list` (an empty list stays empty;
 note the old `[:-1]` on an empty list also returned `[]`, so that edge case never changed).
+
+### Issue #4 — Notified on playlist-add but not on rating
+
+**How I reproduced it.** With a driver script: aaliya shares a song, kenji rates it 5 stars via
+`rate_song`, then I read aaliya's notifications:
+`aaliya notifications before rating: 0, after: 0` while `rating saved? True`. So the rating
+persists but no notification is ever created — exactly aaliya's report. My committed regression
+test `tests/test_notifications.py::test_rating_creates_notification_for_sharer` encodes this
+(it asserts 1 notification; on the unfixed code it fails with `assert 0 == 1`).
+
+**How I found the root cause.** The brief hint said the cause is architectural, so I compared the
+two interaction handlers in `notification_service.py` line by line. `add_to_playlist` ends with a
+guarded `create_notification(...)` call (`if song.shared_by != added_by_user_id:`). `rate_song`
+ends at `db.session.commit(); return rating` — it saves the `Rating` and stops. There is no
+`create_notification` call anywhere in `rate_song`. That asymmetry is the whole bug.
+
+**The root cause.** Notifications in this app are created imperatively by the service that handles
+each interaction; there is no model hook or event that fires automatically. `add_to_playlist`
+does its part; `rate_song` was simply never given the equivalent step. So the rating is written to
+the DB but the sharer is never told — no notification row exists for `GET /users/<id>/notifications`
+to return. It is a missing step, not a typo or a wrong comparison.
+
+**My fix and side-effect check.** I appended the notification step to `rate_song`, mirroring
+`add_to_playlist` exactly: after the commit, `if song.shared_by != user_id:` create a
+`song_rated` notification addressed to `song.shared_by`, with a body naming the rater, song, and
+score. I placed it after the commit so a DB failure on the rating can't leave an orphan
+notification, and I reused the existing `rater`/`song` objects already loaded above. Side-effect
+checks: (a) rating your own song creates no notification — covered by
+`test_rating_own_song_does_not_notify`; (b) the pre-existing playlist-add path is untouched;
+(c) `rate_song` still returns the `Rating` and still supports the update-existing-rating path
+(the notification fires on re-rating too, which is acceptable and matches the "actor interacted"
+semantics). Full suite: see final review.
+
+> **Out-of-scope observation (not fixed):** while writing a sanity test I found that
+> `add_to_playlist` raises an `IntegrityError` when adding a *brand-new* song, because
+> `playlist.songs.append(song)` populates only the FK columns and leaves the NOT-NULL
+> `playlist_entries.position` / `added_by` columns unset. This is a genuine latent defect but it
+> is **not** one of the five tracked issues and is unrelated to the rating-notification fix, so I
+> deliberately left it alone to keep the fix targeted and did not include a test that depends on
+> that path.
