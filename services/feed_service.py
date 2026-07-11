@@ -4,13 +4,15 @@ services/feed_service.py — Mixtape
 Handles the "Friends Listening Now" feed and activity feed logic.
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from sqlalchemy import desc
 from app import db
 from models import User, Song, ListeningEvent
 
 
-RECENT_THRESHOLD = timedelta(hours=24)
+def _start_of_today(now: datetime) -> datetime:
+    """Midnight (UTC) at the start of the calendar day containing `now`."""
+    return now.replace(hour=0, minute=0, second=0, microsecond=0)
 
 
 def get_friends_listening_now(user_id: str) -> list[dict]:
@@ -29,7 +31,10 @@ def get_friends_listening_now(user_id: str) -> list[dict]:
     if not user:
         raise ValueError(f"User {user_id} not found")
 
-    cutoff = datetime.now(timezone.utc) - RECENT_THRESHOLD
+    # "Listening now" means today: only events from the current calendar day,
+    # not a rolling 24-hour window (which would keep last night's listens
+    # visible until the same time the next day).
+    cutoff = _start_of_today(datetime.now(timezone.utc))
     friend_ids = [f.id for f in user.friends]
 
     if not friend_ids:

@@ -192,3 +192,34 @@ semantics). Full suite: see final review.
 > is **not** one of the five tracked issues and is unrelated to the rating-notification fix, so I
 > deliberately left it alone to keep the fix targeted and did not include a test that depends on
 > that path.
+
+### Issue #2 — Friends Listening Now shows people from yesterday
+
+**How I reproduced it.** I crafted a deterministic case: I gave darius a single listening event
+stamped "yesterday 23:00" and asked for nova's feed the next morning. Output:
+`darius last listen=2026-07-10T23:00:00 (6.9h ago) … darius in feed (24h window)? True`, while
+`would midnight-boundary include it? False`. So an event from last night still showed as
+"listening now" this morning — precisely nova's complaint that darius's 11pm listen was still
+visible at 9am. I re-verified the fix with a second script: a yesterday-23:00 listener is
+excluded and a today-00:30 listener is included (`feed: ['kenji', 'simone']`, darius absent).
+
+**How I found the root cause.** Path is `GET /feed/<id>/listening-now` →
+`get_friends_listening_now` in `services/feed_service.py`. The recency filter was
+`cutoff = datetime.now(timezone.utc) - RECENT_THRESHOLD` with `RECENT_THRESHOLD = 24 hours`, then
+`ListeningEvent.listened_at >= cutoff`. The moment I saw "24 hours" I recognized the mismatch
+with the requirement, which is *today*, not *the last 24 hours*.
+
+**The root cause.** The feed used a **rolling 24-hour window** instead of a **calendar-day
+boundary**. A rolling window and "today" only agree at midnight; they diverge for the rest of the
+day. At 9am, `now - 24h` is 9am *yesterday*, so any event from yesterday 9am onward — including a
+listen at 11pm last night — still satisfies `listened_at >= cutoff` and appears as "listening
+now." The stale entries naturally aged out exactly 24 hours after they occurred, which is why
+nova saw last night's listens "hang around until the same time the next day."
+
+**My fix and side-effect check.** I replaced the rolling cutoff with the start of the current
+calendar day (UTC midnight) via a small helper `_start_of_today(now)`
+(`now.replace(hour=0, minute=0, second=0, microsecond=0)`), and removed the now-unused
+`RECENT_THRESHOLD`/`timedelta`. Boundary checks on both sides: an event at 00:30 today is
+included; an event at 23:00 yesterday is excluded (both demonstrated above). I confirmed I did not
+touch `get_activity_feed`, which is intentionally *not* recency-filtered (its docstring says so) —
+so the "recent activity" and "listening now" behaviors stay distinct. Full suite: 15/15 pass.
