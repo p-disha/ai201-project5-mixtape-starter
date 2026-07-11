@@ -223,3 +223,44 @@ calendar day (UTC midnight) via a small helper `_start_of_today(now)`
 included; an event at 23:00 yesterday is excluded (both demonstrated above). I confirmed I did not
 touch `get_activity_feed`, which is intentionally *not* recency-filtered (its docstring says so) —
 so the "recent activity" and "listening now" behaviors stay distinct. Full suite: 15/15 pass.
+
+### Issue #3 — The same song shows up two or three times in search
+
+**How I reproduced it.** Searching `"Anthem"` (Crown Heights Anthem has 3 tags in the seed data),
+I compared the raw joined query to the service result:
+`raw joined rows: 3 [('Crown Heights Anthem',), ('Crown Heights Anthem',), ('Crown Heights Anthem',)]`
+versus `search_songs('Anthem') count: 1`. This is the most interesting entry: the **fan-out to 3
+rows is real and reproducible**, but the *service* returned the song only once.
+
+**How I found the root cause.** Path is `GET /songs/search?q=` → `search_songs` in
+`services/search_service.py`. The query does
+`db.session.query(Song).outerjoin(song_tags, Song.id == song_tags.c.song_id).filter(title/artist ilike).all()`.
+The `outerjoin` to the `song_tags` association table is the culprit: it produces one output row
+per matching (song, tag) pair, so a song with 3 tags yields 3 rows, a song with 1 tag yields 1,
+and a song with 0 tags yields 1 (the outer join's NULL row) — which matches simone's report that
+*some* songs repeat two or three times and others appear once, all from a single-song match.
+
+**Why the service currently returns 1 anyway (the nuance I verified with AI's help).** I expected
+`search_songs` to return 3 and it returned 1. I asked why, verified it myself, and confirmed:
+SQLAlchemy's **legacy `Query` API automatically de-duplicates full-entity result rows by identity
+map**, so the three identical `Song` rows collapse to one *at the service layer only*. That
+implicit safety net is the reason the shipped `test_search_no_duplicates_multi_tag_song` passes on
+the starter. It is not intended behavior and it is fragile: any query that selects columns instead
+of the full entity, or the modern 2.0 `select()` API (which does not auto-unique), exposes the
+duplicates. I demonstrated exactly this — a `query(Song.id)` column query returns **3 rows with
+the join and 1 without** (see repro output above). So the join is a latent duplication bug that
+happens to be masked by an ORM implementation detail.
+
+**The root cause.** `search_songs` joins `song_tags` even though tags are neither filtered on nor
+selected (title/artist drive the filter; `Song.to_dict()` loads tags via the relationship). The
+join therefore only fans rows out per tag and serves no purpose — it is the mechanism behind the
+reported duplicates.
+
+**My fix and side-effect check.** I removed the unnecessary `.outerjoin(song_tags, …)` so the
+query selects distinct `Song` entities directly, and dropped the now-unused `Tag`/`song_tags`
+imports. This fixes the root cause regardless of which query API is used, rather than papering
+over it with a defensive `.distinct()`. Side-effect checks: all 5 `test_search.py` tests pass
+(single-tag, multi-tag, no-tag songs each appear exactly once; matching still works; no-match
+still returns `[]`), and I confirmed each result still carries its `tags` list because
+`Song.to_dict()` loads tags independently of the search query. Column-query demonstration above
+confirms the fan-out is genuinely gone (3 → 1), not merely re-masked.
