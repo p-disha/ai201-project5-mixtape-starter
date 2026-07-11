@@ -99,4 +99,29 @@ but never performs step 4 — that is Issue #4.
 
 ## Root Cause Analysis
 
-_(entries added per fix below)_
+### Issue #1 — My listening streak keeps resetting (Sundays)
+
+**How I reproduced it.** The starter test `test_streak_increments_on_sunday` (Saturday
+2024-06-15 → Sunday 2024-06-16) failed with `assert 1 == 2`: a streak that should have gone to 2
+reset to 1. I confirmed the trigger condition is specifically *the update landing on a Sunday*, matching kenji's report that it only ever happened on a Sunday.
+
+**How I found the root cause.** Route path is `POST /songs/<id>/listen` → `record_listening_event`
+→ `update_listening_streak`. Reading `update_listening_streak` in `services/streak_service.py`,
+the increment branch was `elif days_since_last == 1 and today.weekday() != 6:`. The `!= 6` jumped
+out. I verified against Python directly: `datetime.date.weekday()` returns `6` for Sunday
+(Mon=0 … Sun=6). So on any Sunday, `today.weekday() != 6` is `False`.
+
+**The root cause.** Python's `date.weekday()` returns `6` for Sunday. The increment branch
+required `today.weekday() != 6`, so whenever the consecutive-day listen happened **on a Sunday**,
+the condition was false and execution fell through to the `else` branch, which sets
+`listening_streak = 1`. A perfectly valid Saturday→Sunday continuation was treated as a skipped
+day and the entire streak was discarded. Every other weekday worked, which is exactly the
+"only on Sundays" symptom.
+
+**My fix and side-effect check.** I removed the spurious `and today.weekday() != 6` clause so the
+branch is simply `elif days_since_last == 1:` — a listen exactly one calendar day after the last
+one always continues the streak. Side-effects: I re-ran the full `test_streaks.py` suite (5/5
+pass, up from 4/5). I specifically re-checked both sides of the day boundary that this branch
+governs — same-day (`days_since_last == 0`, no change), consecutive-day (now +1 on every weekday
+including Sunday), and skipped-day (`> 1`, still resets to 1) — so removing the clause fixed the
+Sunday case without weakening the genuine reset-on-skip behavior.
