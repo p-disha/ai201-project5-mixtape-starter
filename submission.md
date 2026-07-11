@@ -125,3 +125,30 @@ pass, up from 4/5). I specifically re-checked both sides of the day boundary tha
 governs — same-day (`days_since_last == 0`, no change), consecutive-day (now +1 on every weekday
 including Sunday), and skipped-day (`> 1`, still resets to 1) — so removing the clause fixed the
 Sunday case without weakening the genuine reset-on-skip behavior.
+
+### Issue #5 — The last song in a playlist never shows up
+
+**How I reproduced it.** Against the seeded "Friday Energy" playlist I compared the raw
+`playlist_entries` row count to what the service returns:
+`entries in DB: 7, returned by service: 6`. The missing one was always the highest-`position`
+row — i.e. the most recently added, exactly as darius reported. The starter test
+`test_playlist_returns_all_songs` (5 songs seeded) also failed, returning 4.
+
+**How I found the root cause.** Path is `GET /playlists/<id>/songs` → `get_playlist_songs` in
+`services/playlist_service.py`. The query is correct — it joins `playlist_entries` and orders by
+`position` ascending. The defect is on the very last line: the return statement slices the
+ordered list with `songs[:-1]`.
+
+**The root cause.** `get_playlist_songs` builds the correctly-ordered list of songs, then returns
+`[song.to_dict() for song in songs[:-1]]`. The `[:-1]` slice drops the last element of the list.
+Because the list is ordered by ascending `position`, the last element is always the
+highest-position row — the most recently added song. That is why adding a new song "freed" the
+previously-missing one (it was no longer last) while hiding the newcomer (now last). The function
+docstring even claims "This function returns all songs in the playlist," which the slice
+contradicts.
+
+**My fix and side-effect check.** I changed `songs[:-1]` to `songs` so every ordered row is
+returned. Side-effects: `test_playlists.py` now passes 3/3 (was 1/3), including
+`test_playlist_returns_songs_in_order` (order preserved — I only removed the truncation, not the
+`ORDER BY position`) and `test_empty_playlist_returns_empty_list` (an empty list stays empty;
+note the old `[:-1]` on an empty list also returned `[]`, so that edge case never changed).
