@@ -264,3 +264,37 @@ over it with a defensive `.distinct()`. Side-effect checks: all 5 `test_search.p
 still returns `[]`), and I confirmed each result still carries its `tags` list because
 `Song.to_dict()` loads tags independently of the search query. Column-query demonstration above
 confirms the fan-out is genuinely gone (3 → 1), not merely re-masked.
+
+---
+
+## Regression Test (stretch)
+
+`tests/test_notifications.py` is a new test file I added for **Issue #4**, which had no test
+coverage in the starter. `test_rating_creates_notification_for_sharer` would have caught the bug
+before it was introduced: it shares a song, rates it as a different user, and asserts the sharer
+receives exactly one `song_rated` notification. On the unfixed `rate_song` it fails with
+`assert 0 == 1`; with the fix it passes. I verified this directly by stashing the fix and
+re-running the test (it failed), then restoring the fix (it passed). The file also includes
+`test_rating_own_song_does_not_notify`, which pins down the "actor ≠ owner" guard so a future
+change can't start spamming users about their own ratings.
+
+The starter also shipped tests that assert post-fix behavior and failed before my changes —
+`test_streak_increments_on_sunday` (#1), `test_playlist_returns_all_songs` /
+`test_playlist_returns_songs_in_order` (#5). Those act as regression tests for those fixes.
+
+**Final state:** `pytest tests/` → **15 passed** (was 12 passed / 3 failed on the starter, plus
+my 2 new notification tests).
+
+---
+
+## Summary of Fixes
+
+| # | Issue | File | One-line fix |
+|---|-------|------|--------------|
+| 1 | Streak resets on Sundays | `streak_service.py` | Dropped the `today.weekday() != 6` clause from the increment branch. |
+| 2 | Feed shows yesterday | `feed_service.py` | Rolling 24h cutoff → start of current calendar day. |
+| 3 | Duplicate search results | `search_service.py` | Removed the needless `song_tags` outer join causing per-tag row fan-out. |
+| 4 | No notification on rating | `notification_service.py` | Added the missing `create_notification` step to `rate_song`, mirroring `add_to_playlist`. |
+| 5 | Last playlist song hidden | `playlist_service.py` | Removed the `songs[:-1]` slice that dropped the highest-position song. |
+
+Each fix is an isolated commit on `bugfix/mixtape` using conventional-commit format.
